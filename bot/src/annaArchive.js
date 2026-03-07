@@ -11,13 +11,54 @@ try {
   cheerio = null;
 }
 
-const BASE_URL = (process.env.ANNA_ARCHIVE_URL || "").replace(/\/+$/, "");
+let BASE_URL = (process.env.ANNA_ARCHIVE_URL || "").replace(/\/+$/, "");
+const ANNA_MIRRORS = [
+  "https://annas-archive.gd",
+  "https://annas-archive.gl",
+  "https://annas-archive.vg",
+  "https://annas-archive.pk",
+];
+const URL_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+let lastUrlCheck = 0;
+
 const MD5_RE = /^[a-f0-9]{32}$/;
 const MAX_HTML_SIZE = 5 * 1024 * 1024;
 const HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 };
+
+async function resolveAnnaUrl() {
+  const now = Date.now();
+  if (BASE_URL && now - lastUrlCheck < URL_CHECK_INTERVAL) return;
+  lastUrlCheck = now;
+
+  // Test current URL first, then try mirrors
+  const urlsToTry = BASE_URL
+    ? [BASE_URL, ...ANNA_MIRRORS.filter((u) => u !== BASE_URL)]
+    : ANNA_MIRRORS;
+
+  for (const url of urlsToTry) {
+    try {
+      const resp = await fetch(`${url}/`, {
+        method: "HEAD",
+        headers: HEADERS,
+        signal: AbortSignal.timeout(5000),
+        redirect: "follow",
+      });
+      if (resp.ok || resp.status === 301 || resp.status === 302) {
+        if (url !== BASE_URL) {
+          console.log(`Anna's Archive URL updated: ${BASE_URL || "(none)"} → ${url}`);
+          BASE_URL = url;
+        }
+        return;
+      }
+    } catch {
+      // try next mirror
+    }
+  }
+  console.warn("All Anna's Archive mirrors unreachable");
+}
 
 function sanitizeExt(ext) {
   const cleaned = (ext || "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 10);
@@ -73,6 +114,7 @@ function parseSizeFromText(text) {
 }
 
 async function search(query) {
+  await resolveAnnaUrl();
   if (!BASE_URL) return [];
 
   const params = new URLSearchParams({

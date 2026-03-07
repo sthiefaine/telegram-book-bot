@@ -24,8 +24,6 @@ services:
       - BOOKS_DOWNLOAD_PATH=${BOOKS_DOWNLOAD_PATH:-/downloads/books}
       - DOWNLOAD_TIMEOUT_MINUTES=${DOWNLOAD_TIMEOUT_MINUTES:-15}
       - LOCAL_API_SERVER=${LOCAL_API_SERVER}
-    volumes:
-      - ${BOOKS_DOWNLOAD_PATH:-/downloads/books}:${BOOKS_DOWNLOAD_PATH:-/downloads/books}:ro
     depends_on:
       - prowlarr
     restart: unless-stopped
