@@ -2,10 +2,10 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY bot/package*.json ./
 RUN npm install --omit=dev
 
-COPY src/ ./src/
+COPY bot/src/ ./src/
 
 USER node
 
