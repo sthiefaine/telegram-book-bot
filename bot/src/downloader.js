@@ -1,8 +1,6 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { URL } = require("url");
-const net = require("net");
 const annaArchive = require("./annaArchive");
 const { grab } = require("./prowlarr");
 const { waitForFile } = require("./watcher");
@@ -34,7 +32,7 @@ async function downloadResult(result, progressCallback, maxBytes = 0) {
   }
 
   if (source === "prowlarr") {
-    if (result.is_torrent) {
+    if (result.isTorrent) {
       return downloadTorrent(result);
     }
     return downloadDirect(result.downloadUrl, result.ext, progressCallback, maxBytes);
@@ -54,6 +52,12 @@ async function downloadDirect(url, ext, progressCallback, maxBytes = 0) {
   });
 
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+  // Check Content-Length before streaming
+  const contentLength = parseInt(resp.headers.get("content-length") || "0");
+  if (maxBytes && contentLength > maxBytes) {
+    throw new Error(`File too large (Content-Length: ${Math.floor(contentLength / 1024 / 1024)} MB)`);
+  }
 
   const ctype = (resp.headers.get("content-type") || "").split(";")[0].trim();
   if (ctype && !VALID_CONTENT_TYPES.has(ctype)) {
@@ -117,7 +121,7 @@ async function downloadTorrent(result) {
   const downloadPath = process.env.BOOKS_DOWNLOAD_PATH || "/downloads/books";
   const timeoutMinutes = parseInt(process.env.DOWNLOAD_TIMEOUT_MINUTES || "15");
 
-  await grab(result.indexer_id, result.guid);
+  await grab(result.indexerId, result.guid);
   return waitForFile(result.title, downloadPath, timeoutMinutes);
 }
 

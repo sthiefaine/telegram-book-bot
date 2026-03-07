@@ -23,25 +23,22 @@ services:
       - ANNA_ARCHIVE_URL=${ANNA_ARCHIVE_URL}
       - BOOKS_DOWNLOAD_PATH=${BOOKS_DOWNLOAD_PATH:-/downloads/books}
       - DOWNLOAD_TIMEOUT_MINUTES=${DOWNLOAD_TIMEOUT_MINUTES:-15}
-      - LOCAL_API_SERVER=${LOCAL_API_SERVER}
+      - LOCAL_API_SERVER=http://telegram-bot-api:8081
     depends_on:
       - prowlarr
+      - telegram-bot-api
     restart: unless-stopped
 
-  # Optional: Local Telegram Bot API server for files > 50 MB
-  # Uncomment and set LOCAL_API_ID and LOCAL_API_HASH in .env
-  # telegram-bot-api:
-  #   image: ghcr.io/tdlib/telegram-bot-api:latest
-  #   restart: unless-stopped
-  #   volumes:
-  #     - telegram-bot-api-data:/var/lib/telegram-bot-api
-  #   command:
-  #     - --api-id=${LOCAL_API_ID}
-  #     - --api-hash=${LOCAL_API_HASH}
-  #     - --local
-  #     - --http-port=8081
-  #     - --dir=/var/lib/telegram-bot-api
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${LOCAL_API_ID}
+      - TELEGRAM_API_HASH=${LOCAL_API_HASH}
+      - TELEGRAM_LOCAL=true
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
 
 volumes:
   prowlarr-config:
-  # telegram-bot-api-data:
+  telegram-bot-api-data:

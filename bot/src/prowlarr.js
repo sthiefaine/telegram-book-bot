@@ -48,17 +48,17 @@ async function searchBooks(query) {
         title: item.title || "",
         author: "",
         ext: guessExt(item),
-        size_bytes: item.size || 0,
+        sizeBytes: item.size || 0,
         size: formatSize(item.size),
         seeders: item.seeders || 0,
         leechers: item.leechers || 0,
         indexer: item.indexer,
-        indexer_id: item.indexerId || 0,
+        indexerId: item.indexerId || 0,
         guid: item.guid || "",
         downloadUrl: dlUrl,
         infoUrl: item.infoUrl,
-        magnet_url: magnet,
-        is_torrent: isTorrent,
+        magnetUrl: magnet,
+        isTorrent,
       };
     });
   } catch (error) {

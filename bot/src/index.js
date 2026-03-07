@@ -8,11 +8,13 @@ const annaArchive = require("./annaArchive");
 const { downloadResult } = require("./downloader");
 
 // Config
-const MAX_RESULTS = 10;
+const RESULTS_PER_PAGE = 5;
 const MAX_QUERY_LENGTH = 200;
 const RATE_LIMIT_SECONDS = 5;
 const LOCAL_API_SERVER = (process.env.LOCAL_API_SERVER || "").replace(/\/+$/, "");
 const MAX_FILE_SIZE = LOCAL_API_SERVER ? 400 * 1024 * 1024 : 50 * 1024 * 1024;
+const STATE_TTL = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 // Whitelist
 const ALLOWED_USER_IDS = new Set();
@@ -28,29 +30,67 @@ for (const uid of (process.env.ALLOWED_USER_IDS || "").split(",")) {
 // Bot setup
 const botOptions = {};
 if (LOCAL_API_SERVER) {
-  botOptions.telegram = {
-    apiRoot: LOCAL_API_SERVER,
-  };
+  botOptions.telegram = { apiRoot: LOCAL_API_SERVER };
   console.log(`Local Bot API mode: ${LOCAL_API_SERVER} (limit ${Math.floor(MAX_FILE_SIZE / 1024 / 1024)} MB)`);
 }
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, botOptions);
 
-// Per-user state
+// Per-user state with TTL
 const userState = new Map();
 
 function getUserState(userId) {
-  if (!userState.has(userId)) {
-    userState.set(userId, { results: [], lastSearchAt: 0, activeDlAbort: null });
+  const now = Date.now();
+  if (userState.has(userId)) {
+    const state = userState.get(userId);
+    state.lastActivity = now;
+    return state;
   }
-  return userState.get(userId);
+  const state = { results: [], allResults: [], lastSearchAt: 0, activeDlAbort: null, page: 0, lastActivity: now };
+  userState.set(userId, state);
+  return state;
 }
 
-// Whitelist middleware
+// Cleanup inactive user states every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, state] of userState) {
+    if (now - state.lastActivity > STATE_TTL) {
+      userState.delete(userId);
+    }
+  }
+}, 10 * 60 * 1000);
+
+// Search cache
+const searchCache = new Map();
+
+function getCachedSearch(query) {
+  const key = query.toLowerCase().trim();
+  const cached = searchCache.get(key);
+  if (cached && Date.now() - cached.time < CACHE_TTL) {
+    console.log(`Cache hit for "${query}"`);
+    return cached.results;
+  }
+  searchCache.delete(key);
+  return null;
+}
+
+function setCachedSearch(query, results) {
+  const key = query.toLowerCase().trim();
+  searchCache.set(key, { results, time: Date.now() });
+  // Limit cache size
+  if (searchCache.size > 200) {
+    const oldest = searchCache.keys().next().value;
+    searchCache.delete(oldest);
+  }
+}
+
+// Whitelist middleware — FIX: explicitly return to block unauthorized users
 bot.use((ctx, next) => {
   if (ALLOWED_USER_IDS.size === 0) return next();
   const uid = ctx.from?.id;
   if (uid && ALLOWED_USER_IDS.has(uid)) return next();
+  return; // Block unauthorized users
 });
 
 function fmtSize(bytes) {
@@ -62,6 +102,12 @@ function fmtSize(bytes) {
 function progressBar(pct) {
   const filled = Math.floor(pct / 10);
   return "▰".repeat(filled) + "▱".repeat(10 - filled);
+}
+
+function sourceTag(result) {
+  if (result.source === "anna") return "[AA]";
+  if (result.source === "prowlarr") return "[PR]";
+  return "";
 }
 
 // /start
@@ -82,6 +128,36 @@ bot.help((ctx) => {
     "Envoie simplement le titre d'un livre pour lancer une recherche."
   );
 });
+
+function buildResultButtons(results, page) {
+  const start = page * RESULTS_PER_PAGE;
+  const pageResults = results.slice(start, start + RESULTS_PER_PAGE);
+  const buttons = [];
+
+  for (let i = 0; i < pageResults.length; i++) {
+    const r = pageResults[i];
+    const globalIdx = start + i;
+    const icon = r.isTorrent ? "🌀" : "📥";
+    const tag = sourceTag(r);
+    const ext = (r.ext || "?").toUpperCase();
+    const titleShort = r.title.length > 35 ? r.title.slice(0, 35) + "…" : r.title;
+    let label = `${icon} ${tag} ${titleShort} · ${ext}`;
+    if (r.author) label += ` – ${r.author.slice(0, 15)}`;
+    buttons.push([Markup.button.callback(label, `dl_${globalIdx}`)]);
+  }
+
+  // Pagination buttons
+  const navRow = [];
+  if (page > 0) {
+    navRow.push(Markup.button.callback("⬅️ Précédent", `page_${page - 1}`));
+  }
+  if (start + RESULTS_PER_PAGE < results.length) {
+    navRow.push(Markup.button.callback("➡️ Suivant", `page_${page + 1}`));
+  }
+  if (navRow.length) buttons.push(navRow);
+
+  return buttons;
+}
 
 // Search handler
 async function handleSearch(ctx) {
@@ -104,32 +180,38 @@ async function handleSearch(ctx) {
   const searchMsg = await ctx.reply("🔍 Recherche en cours...");
 
   try {
-    // Search Anna's Archive and Prowlarr in parallel
-    const [aaResults, prResults] = await Promise.all([
-      safeSearch(() => annaArchive.search(query), "Anna's Archive"),
-      safeSearch(() => searchBooks(query), "Prowlarr"),
-    ]);
+    // Check cache first
+    let aaResults, prResults;
+    const cached = getCachedSearch(query);
+    if (cached) {
+      aaResults = cached.aa;
+      prResults = cached.pr;
+    } else {
+      // Search in parallel, track which sources failed
+      const aaPromise = safeSearch(() => annaArchive.search(query), "Anna's Archive");
+      const prPromise = safeSearch(() => searchBooks(query), "Prowlarr");
+      [aaResults, prResults] = await Promise.all([aaPromise, prPromise]);
+      setCachedSearch(query, { aa: aaResults, pr: prResults });
+    }
 
     console.log(`=== Results for "${query}" ===`);
     console.log(`Anna's Archive (${aaResults.length}), Prowlarr (${prResults.length})`);
 
     // Merge: epub first, direct before torrents
-    const direct = [...aaResults, ...prResults].filter((r) => !r.is_torrent);
-    const torrents = prResults.filter((r) => r.is_torrent);
+    const direct = [...aaResults, ...prResults].filter((r) => !r.isTorrent);
+    const torrents = prResults.filter((r) => r.isTorrent);
 
     direct.sort((a, b) => {
       const extA = a.ext === "epub" ? 0 : 1;
       const extB = b.ext === "epub" ? 0 : 1;
       if (extA !== extB) return extA - extB;
-      const torA = a.is_torrent ? 1 : 0;
-      const torB = b.is_torrent ? 1 : 0;
-      return torA - torB;
+      return (a.isTorrent ? 1 : 0) - (b.isTorrent ? 1 : 0);
     });
 
-    const allResults = [...direct, ...torrents];
+    const allMerged = [...direct, ...torrents];
 
     // Filter oversized
-    const filtered = allResults.filter((r) => !(r.size_bytes > MAX_FILE_SIZE));
+    const filtered = allMerged.filter((r) => !(r.sizeBytes > MAX_FILE_SIZE));
 
     // Deduplicate by normalized title (first 35 chars)
     const seenTitles = new Set();
@@ -139,69 +221,68 @@ async function handleSearch(ctx) {
       if (norm && seenTitles.has(norm)) continue;
       if (norm) seenTitles.add(norm);
       results.push(r);
-      if (results.length >= MAX_RESULTS) break;
+    }
+
+    // Build status message
+    let statusParts = [];
+    if (aaResults.length === 0 && prResults.length === 0) {
+      // both returned nothing
+    } else {
+      if (aaResults.length === 0) statusParts.push("Anna's Archive : aucun résultat");
+      if (prResults.length === 0) statusParts.push("Prowlarr : aucun résultat");
     }
 
     if (results.length === 0) {
-      return ctx.telegram.editMessageText(
-        ctx.chat.id,
-        searchMsg.message_id,
-        undefined,
-        `😕 Aucun résultat trouvé pour « ${query} ».\nEssaie un autre titre ou orthographe.`
-      );
+      let msg = `😕 Aucun résultat trouvé pour « ${query} ».`;
+      if (statusParts.length) msg += `\n${statusParts.join("\n")}`;
+      msg += "\nEssaie un autre titre ou orthographe.";
+      return ctx.telegram.editMessageText(ctx.chat.id, searchMsg.message_id, undefined, msg);
     }
 
+    state.allResults = results;
     state.results = results;
+    state.page = 0;
 
     // Check epub availability
     const hasEpub = results.some((r) => r.ext === "epub");
-    const nonEpubResults = results.filter((r) => r.ext !== "epub");
 
     // If no epub, ask confirmation
-    if (!hasEpub && nonEpubResults.length > 0) {
-      const exts = [...new Set(nonEpubResults.map((r) => (r.ext || "?").toUpperCase()))];
+    if (!hasEpub) {
+      const exts = [...new Set(results.map((r) => (r.ext || "?").toUpperCase()))];
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback(`✅ Oui, envoie-moi en ${exts.join(", ")}`, "confirm_non_epub")],
         [Markup.button.callback("❌ Non, annuler", "cancel_search")],
       ]);
       return ctx.telegram.editMessageText(
-        ctx.chat.id,
-        searchMsg.message_id,
-        undefined,
+        ctx.chat.id, searchMsg.message_id, undefined,
         `📚 Pas d'epub disponible pour « ${query} ».\n` +
         `J'ai trouvé ${results.length} résultat(s) en ${exts.join(", ")}. Ça ira ?`,
         keyboard
       );
     }
 
-    // Build buttons
-    const buttons = [];
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r.ext !== "epub" && hasEpub) continue;
-      const icon = r.is_torrent ? "🌀" : "📥";
-      const titleShort = r.title.length > 45 ? r.title.slice(0, 45) + "…" : r.title;
-      let label = `${icon} ${titleShort}`;
-      if (r.author) label += ` – ${r.author.slice(0, 20)}`;
-      buttons.push([Markup.button.callback(label, `dl_${i}`)]);
-    }
+    // Show format filter + results
+    const filterRow = [
+      Markup.button.callback("📚 Tous", "filter_all"),
+      Markup.button.callback("📗 EPUB", "filter_epub"),
+      Markup.button.callback("📕 PDF", "filter_pdf"),
+      Markup.button.callback("📙 MOBI", "filter_mobi"),
+    ];
+    const resultButtons = buildResultButtons(results, 0);
 
-    const n = buttons.length;
-    const keyboard = Markup.inlineKeyboard(buttons);
+    const n = results.length;
+    let header = `📚 ${n} résultat${n > 1 ? "s" : ""} trouvé${n > 1 ? "s" : ""} :`;
+    if (statusParts.length) header += `\n${statusParts.join(" · ")}`;
 
     await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      searchMsg.message_id,
-      undefined,
-      `📚 ${n} résultat${n > 1 ? "s" : ""} trouvé${n > 1 ? "s" : ""} :`,
-      keyboard
+      ctx.chat.id, searchMsg.message_id, undefined,
+      header,
+      Markup.inlineKeyboard([filterRow, ...resultButtons])
     );
   } catch (error) {
     console.error("Search error:", error);
     await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      searchMsg.message_id,
-      undefined,
+      ctx.chat.id, searchMsg.message_id, undefined,
       "❌ Erreur lors de la recherche."
     );
   }
@@ -225,24 +306,73 @@ bot.on("text", (ctx) => {
   return handleSearch(ctx);
 });
 
+// Format filter handlers
+for (const format of ["all", "epub", "pdf", "mobi"]) {
+  bot.action(`filter_${format}`, async (ctx) => {
+    await ctx.answerCbQuery();
+    const state = getUserState(ctx.from.id);
+    if (!state.allResults.length) {
+      return ctx.editMessageText("❌ Résultat expiré, refais une recherche.");
+    }
+
+    if (format === "all") {
+      state.results = state.allResults;
+    } else {
+      state.results = state.allResults.filter((r) => r.ext === format);
+    }
+    state.page = 0;
+
+    if (state.results.length === 0) {
+      return ctx.editMessageText(`😕 Aucun résultat en ${format.toUpperCase()}.`);
+    }
+
+    const filterRow = [
+      Markup.button.callback(format === "all" ? "📚 ✓Tous" : "📚 Tous", "filter_all"),
+      Markup.button.callback(format === "epub" ? "📗 ✓EPUB" : "📗 EPUB", "filter_epub"),
+      Markup.button.callback(format === "pdf" ? "📕 ✓PDF" : "📕 PDF", "filter_pdf"),
+      Markup.button.callback(format === "mobi" ? "📙 ✓MOBI" : "📙 MOBI", "filter_mobi"),
+    ];
+    const resultButtons = buildResultButtons(state.results, 0);
+    const n = state.results.length;
+
+    await ctx.editMessageText(
+      `📚 ${n} résultat${n > 1 ? "s" : ""} (${format.toUpperCase()}) :`,
+      Markup.inlineKeyboard([filterRow, ...resultButtons])
+    );
+  });
+}
+
+// Pagination handler
+bot.action(/page_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const page = parseInt(ctx.match[1]);
+  const state = getUserState(ctx.from.id);
+  if (!state.results.length) {
+    return ctx.editMessageText("❌ Résultat expiré, refais une recherche.");
+  }
+
+  state.page = page;
+  const resultButtons = buildResultButtons(state.results, page);
+  const total = state.results.length;
+  const start = page * RESULTS_PER_PAGE + 1;
+  const end = Math.min((page + 1) * RESULTS_PER_PAGE, total);
+
+  await ctx.editMessageText(
+    `📚 Résultats ${start}-${end} sur ${total} :`,
+    Markup.inlineKeyboard(resultButtons)
+  );
+});
+
 // Confirm non-epub
 bot.action("confirm_non_epub", async (ctx) => {
   await ctx.answerCbQuery();
   const state = getUserState(ctx.from.id);
-  const results = state.results;
-  if (!results.length) {
+  if (!state.results.length) {
     return ctx.editMessageText("❌ Résultat expiré, refais une recherche.");
   }
 
-  const buttons = results.map((r, i) => {
-    const icon = r.is_torrent ? "🌀" : "📥";
-    const titleShort = (r.title || "?").slice(0, 40);
-    const ext = (r.ext || "?").toUpperCase();
-    const size = fmtSize(r.size_bytes);
-    return [Markup.button.callback(`${icon} ${titleShort} — ${ext} — ${size}`, `dl_${i}`)];
-  });
-
-  await ctx.editMessageText("📚 Choisis un résultat :", Markup.inlineKeyboard(buttons));
+  const resultButtons = buildResultButtons(state.results, 0);
+  await ctx.editMessageText("📚 Choisis un résultat :", Markup.inlineKeyboard(resultButtons));
 });
 
 // Cancel search
@@ -250,6 +380,7 @@ bot.action("cancel_search", async (ctx) => {
   await ctx.answerCbQuery();
   const state = getUserState(ctx.from.id);
   state.results = [];
+  state.allResults = [];
   await ctx.editMessageText("🔍 Recherche annulée. Envoie un nouveau titre quand tu veux !");
 });
 
@@ -299,13 +430,13 @@ bot.action(/dl_(\d+)/, async (ctx) => {
         await ctx.editMessageText(`🔄 Essai du résultat suivant : « ${title} »...`, cancelKb);
       }
 
-      if (result.is_torrent) {
+      if (result.isTorrent) {
         await ctx.editMessageText(
           `🌀 Envoi vers le client torrent pour « ${title} »...\n⏳ Surveillance du dossier...`,
           cancelKb
         );
       } else {
-        await ctx.editMessageText("⏳ Recherche du fichier...", cancelKb);
+        await ctx.editMessageText(`⏳ Recherche du fichier ${sourceTag(result)}...`, cancelKb);
       }
 
       const onProgress = async (downloaded, total) => {
@@ -329,7 +460,7 @@ bot.action(/dl_(\d+)/, async (ctx) => {
       try {
         filePath = await downloadResult(
           result,
-          result.is_torrent ? null : onProgress,
+          result.isTorrent ? null : onProgress,
           MAX_FILE_SIZE
         );
       } catch (e) {

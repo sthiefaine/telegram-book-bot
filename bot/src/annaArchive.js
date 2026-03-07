@@ -152,10 +152,10 @@ function parseJson(data) {
         title: item.title || "",
         author: item.author || "",
         ext: sanitizeExt(ext),
-        size_bytes: parseInt(size) || 0,
+        sizeBytes: parseInt(size) || 0,
         md5,
-        download_url: `https://libgen.rocks/get.php?md5=${md5}`,
-        is_torrent: false,
+        downloadUrl: `https://libgen.rocks/get.php?md5=${md5}`,
+        isTorrent: false,
       });
     } catch (e) {
       // skip item
@@ -206,10 +206,10 @@ async function searchHtml(query) {
         title: text.slice(0, 120),
         author: "",
         ext: sanitizeExt(ext),
-        size_bytes: parseSizeFromText(text),
+        sizeBytes: parseSizeFromText(text),
         md5,
-        download_url: `https://libgen.rocks/get.php?md5=${md5}`,
-        is_torrent: false,
+        downloadUrl: `https://libgen.rocks/get.php?md5=${md5}`,
+        isTorrent: false,
       });
       if (seenMd5.size >= 10) return false;
     });
@@ -286,6 +286,14 @@ async function streamToFile(url, ext, progressCallback, maxBytes) {
       redirect: "follow",
     });
     if (!resp.ok) return null;
+
+    // Check Content-Length before streaming
+    const contentLength = parseInt(resp.headers.get("content-length") || "0");
+    if (maxBytes && contentLength > maxBytes) {
+      console.log(`Skipping ${redactUrl(url)}: Content-Length ${contentLength} exceeds max ${maxBytes}`);
+      return null;
+    }
+
     const ctype = (resp.headers.get("content-type") || "").split(";")[0].trim();
 
     if (ctype.includes("text/html")) {
