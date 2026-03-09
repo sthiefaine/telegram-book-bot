@@ -6,7 +6,7 @@ const { Telegraf, Markup } = require("telegraf");
 const { searchBooks } = require("./prowlarr");
 const annaArchive = require("./annaArchive");
 const { downloadResult } = require("./downloader");
-const { getUserPrefs, setUserPrefs } = require("./prefs");
+const { getUserPrefs, setUserPrefs, addToHistory, addToFavorites, removeFromFavorites } = require("./prefs");
 const mailer = require("./mailer");
 
 // Config
@@ -213,8 +213,11 @@ bot.help((ctx) => {
     "📖 Commandes :\n\n" +
     "/start - Message de bienvenue\n" +
     "/settings - Modifier tes preferences\n" +
+    "/history - Derniers telechargements\n" +
+    "/favorites - Tes livres favoris\n" +
     "/help - Cette aide\n\n" +
-    "Envoie un titre de livre pour lancer une recherche."
+    "Envoie un titre de livre pour lancer une recherche.\n" +
+    "Tu peux aussi utiliser @botname titre dans n'importe quel chat !"
   );
 });
 
@@ -318,6 +321,76 @@ for (const method of ["telegram", "email", "kindle"]) {
   });
 }
 
+// /history
+bot.command("history", (ctx) => {
+  const prefs = getUserPrefs(ctx.from.id);
+  const history = prefs.history || [];
+  if (history.length === 0) {
+    return ctx.reply("📜 Aucun telechargement pour l'instant.");
+  }
+  const lines = history.slice(0, 10).map((h, i) => {
+    const date = new Date(h.date).toLocaleDateString("fr-FR");
+    return `${i + 1}. ${h.title} · ${(h.ext || "?").toUpperCase()} (${date})`;
+  });
+  ctx.reply(`📜 Derniers telechargements :\n\n${lines.join("\n")}`);
+});
+
+// /favorites
+bot.command("favorites", (ctx) => {
+  const prefs = getUserPrefs(ctx.from.id);
+  const favorites = prefs.favorites || [];
+  if (favorites.length === 0) {
+    return ctx.reply("⭐ Aucun favori. Clique sur ⭐ dans la fiche d'un livre pour l'ajouter.");
+  }
+  const buttons = favorites.slice(0, 10).map((f, i) => {
+    const ext = (f.ext || "?").toUpperCase();
+    const label = `${f.title.slice(0, 40)} · ${ext}`;
+    return [
+      Markup.button.callback(label, `favdl_${i}`),
+      Markup.button.callback("🗑", `favdel_${i}`),
+    ];
+  });
+  ctx.reply("⭐ Tes favoris :", Markup.inlineKeyboard(buttons));
+});
+
+// Add to favorites from book info card
+bot.action(/fav_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const index = parseInt(ctx.match[1]);
+  const state = getUserState(ctx.from.id);
+  const results = state.results;
+  if (!results.length || index >= results.length) {
+    return ctx.answerCbQuery("Resultat expire");
+  }
+  const added = addToFavorites(ctx.from.id, results[index]);
+  if (added) {
+    await ctx.answerCbQuery("⭐ Ajoute aux favoris !");
+  } else {
+    await ctx.answerCbQuery("Deja dans les favoris");
+  }
+});
+
+// Remove from favorites
+bot.action(/favdel_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const index = parseInt(ctx.match[1]);
+  removeFromFavorites(ctx.from.id, index);
+  // Refresh favorites list
+  const prefs = getUserPrefs(ctx.from.id);
+  const favorites = prefs.favorites || [];
+  if (favorites.length === 0) {
+    return ctx.editMessageText("⭐ Plus aucun favori.");
+  }
+  const buttons = favorites.slice(0, 10).map((f, i) => {
+    const ext = (f.ext || "?").toUpperCase();
+    return [
+      Markup.button.callback(`${f.title.slice(0, 40)} · ${ext}`, `favdl_${i}`),
+      Markup.button.callback("🗑", `favdel_${i}`),
+    ];
+  });
+  await ctx.editMessageText("⭐ Tes favoris :", Markup.inlineKeyboard(buttons));
+});
+
 // Cancel settings input
 bot.command("cancel", (ctx) => {
   const state = getUserState(ctx.from.id);
@@ -339,7 +412,7 @@ function buildResultButtons(results, page) {
     const titleShort = r.title.length > 35 ? r.title.slice(0, 35) + "…" : r.title;
     let label = `${icon} ${tag} ${titleShort} · ${ext}`;
     if (r.author) label += ` – ${r.author.slice(0, 15)}`;
-    buttons.push([Markup.button.callback(label, `dl_${globalIdx}`)]);
+    buttons.push([Markup.button.callback(label, `info_${globalIdx}`)]);
   }
 
   // Pagination buttons
@@ -393,13 +466,14 @@ async function handleSearch(ctx) {
     console.log(`=== Results for "${query}" ===`);
     console.log(`Anna's Archive (${aaResults.length}), Prowlarr (${prResults.length})`);
 
-    // Merge: epub first, direct before torrents
+    // Merge: preferred format first, then epub, direct before torrents
+    const preferredFormat = getUserPrefs(ctx.from.id).format || "epub";
     const direct = [...aaResults, ...prResults].filter((r) => !r.isTorrent);
     const torrents = prResults.filter((r) => r.isTorrent);
 
     direct.sort((a, b) => {
-      const extA = a.ext === "epub" ? 0 : 1;
-      const extB = b.ext === "epub" ? 0 : 1;
+      const extA = a.ext === preferredFormat ? 0 : a.ext === "epub" ? 1 : 2;
+      const extB = b.ext === preferredFormat ? 0 : b.ext === "epub" ? 1 : 2;
       if (extA !== extB) return extA - extB;
       return (a.isTorrent ? 1 : 0) - (b.isTorrent ? 1 : 0);
     });
@@ -648,6 +722,56 @@ bot.action("cancel_dl", async (ctx) => {
   }
 });
 
+// ─── Book info card ───
+
+bot.action(/info_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const index = parseInt(ctx.match[1]);
+  const state = getUserState(ctx.from.id);
+  const results = state.results;
+
+  if (!results.length || index >= results.length) {
+    return ctx.editMessageText("❌ Resultat expire, refais une recherche.");
+  }
+
+  const r = results[index];
+  const sourceName = r.source === "anna" ? "Anna's Archive" : r.source === "prowlarr" ? "Prowlarr" : "Inconnu";
+  const lines = [
+    `📖 ${r.title}`,
+    r.author ? `✍️ ${r.author}` : null,
+    `📄 Format : ${(r.ext || "?").toUpperCase()}`,
+    `📦 Taille : ${fmtSize(r.sizeBytes)}`,
+    `🔗 Source : ${sourceName}`,
+    r.isTorrent ? "🌀 Torrent" : null,
+  ].filter(Boolean);
+
+  const buttons = [
+    [
+      Markup.button.callback("⬇️ Telecharger", `dl_${index}`),
+      Markup.button.callback("⭐ Favori", `fav_${index}`),
+    ],
+    [Markup.button.callback("↩️ Retour", "back_results")],
+  ];
+
+  await ctx.editMessageText(lines.join("\n"), Markup.inlineKeyboard(buttons));
+});
+
+// Back to results list
+bot.action("back_results", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = getUserState(ctx.from.id);
+  if (!state.results.length) {
+    return ctx.editMessageText("❌ Resultat expire, refais une recherche.");
+  }
+
+  const resultButtons = buildResultButtons(state.results, state.page || 0);
+  const n = state.results.length;
+  await ctx.editMessageText(
+    `📚 ${n} resultat${n > 1 ? "s" : ""} :`,
+    Markup.inlineKeyboard(resultButtons)
+  );
+});
+
 // ─── Delivery ───
 
 async function deliverFile(ctx, filePath, filename, title, prefs) {
@@ -782,6 +906,7 @@ bot.action(/dl_(\d+)/, async (ctx) => {
 
       try {
         await deliverFile(ctx, filePath, filename, title, prefs);
+        addToHistory(ctx.from.id, result);
       } finally {
         if (filePath && filePath.startsWith(os.tmpdir())) {
           try { fs.unlinkSync(filePath); } catch {}
@@ -807,6 +932,59 @@ bot.action(/dl_(\d+)/, async (ctx) => {
     if (filePath && filePath.startsWith(os.tmpdir())) {
       try { fs.unlinkSync(filePath); } catch {}
     }
+  }
+});
+
+// ─── Inline mode ───
+
+bot.on("inline_query", async (ctx) => {
+  const query = ctx.inlineQuery.query.trim();
+  if (query.length < 3) {
+    return ctx.answerInlineQuery([], { cache_time: 5 });
+  }
+
+  try {
+    let aaResults, prResults;
+    const cached = getCachedSearch(query);
+    if (cached) {
+      aaResults = cached.aa;
+      prResults = cached.pr;
+    } else {
+      const aaPromise = safeSearch(() => annaArchive.search(query), "Anna's Archive");
+      const prPromise = safeSearch(() => searchBooks(query), "Prowlarr");
+      [aaResults, prResults] = await Promise.all([aaPromise, prPromise]);
+      setCachedSearch(query, { aa: aaResults, pr: prResults });
+    }
+
+    const all = [...aaResults, ...prResults].filter((r) => !r.isTorrent);
+    const results = all.slice(0, 10).map((r, i) => {
+      const ext = (r.ext || "?").toUpperCase();
+      const size = fmtSize(r.sizeBytes);
+      const tag = r.source === "anna" ? "Anna's Archive" : "Prowlarr";
+      const desc = [r.author, ext, size, tag].filter(Boolean).join(" · ");
+
+      return {
+        type: "article",
+        id: `inline_${i}_${Date.now()}`,
+        title: r.title || "Livre",
+        description: desc,
+        input_message_content: {
+          message_text:
+            `📖 ${r.title}\n` +
+            (r.author ? `✍️ ${r.author}\n` : "") +
+            `📄 ${ext} · ${size}\n` +
+            `🔗 ${tag}`,
+        },
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.url("🔍 Ouvrir le bot", `https://t.me/${ctx.botInfo.username}?start=search_${encodeURIComponent(r.title.slice(0, 40))}`)],
+        ]).reply_markup,
+      };
+    });
+
+    await ctx.answerInlineQuery(results, { cache_time: 300 });
+  } catch (e) {
+    console.error("Inline query error:", e.message);
+    await ctx.answerInlineQuery([], { cache_time: 10 });
   }
 });
 

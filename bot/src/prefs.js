@@ -5,12 +5,17 @@ const os = require("os");
 const PREFS_DIR = process.env.PREFS_DIR || path.join(process.cwd(), "data");
 const PREFS_FILE = path.join(PREFS_DIR, "prefs.json");
 
+const MAX_HISTORY = 20;
+const MAX_FAVORITES = 50;
+
 const DEFAULT_PREFS = {
   format: "epub",
   email: null,
   kindleEmail: null,
   delivery: "telegram", // "telegram" | "email" | "kindle"
   onboarded: false,
+  history: [],
+  favorites: [],
 };
 
 let prefsCache = {};
@@ -63,8 +68,42 @@ function deleteUserPrefs(userId) {
   savePrefs();
 }
 
+function addToHistory(userId, entry) {
+  const key = String(userId);
+  const prefs = getUserPrefs(userId);
+  const item = { title: entry.title, author: entry.author || "", ext: entry.ext, source: entry.source, date: new Date().toISOString() };
+  prefs.history = [item, ...prefs.history.slice(0, MAX_HISTORY - 1)];
+  prefsCache[key] = prefs;
+  savePrefs();
+}
+
+function addToFavorites(userId, entry) {
+  const key = String(userId);
+  const prefs = getUserPrefs(userId);
+  // Avoid duplicates by title+ext
+  const exists = prefs.favorites.some((f) => f.title === entry.title && f.ext === entry.ext);
+  if (exists) return false;
+  const item = { title: entry.title, author: entry.author || "", ext: entry.ext, source: entry.source, md5: entry.md5 || null, downloadUrl: entry.downloadUrl || null };
+  prefs.favorites = [item, ...prefs.favorites.slice(0, MAX_FAVORITES - 1)];
+  prefsCache[key] = prefs;
+  savePrefs();
+  return true;
+}
+
+function removeFromFavorites(userId, index) {
+  const key = String(userId);
+  const prefs = getUserPrefs(userId);
+  if (index >= 0 && index < prefs.favorites.length) {
+    prefs.favorites.splice(index, 1);
+    prefsCache[key] = prefs;
+    savePrefs();
+    return true;
+  }
+  return false;
+}
+
 // Load on startup
 loadPrefs();
 console.log(`Prefs loaded: ${Object.keys(prefsCache).length} user(s)`);
 
-module.exports = { getUserPrefs, setUserPrefs, deleteUserPrefs, DEFAULT_PREFS };
+module.exports = { getUserPrefs, setUserPrefs, deleteUserPrefs, addToHistory, addToFavorites, removeFromFavorites, DEFAULT_PREFS };
