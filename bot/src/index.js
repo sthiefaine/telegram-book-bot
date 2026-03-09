@@ -6,6 +6,8 @@ const { Telegraf, Markup } = require("telegraf");
 const { searchBooks } = require("./prowlarr");
 const annaArchive = require("./annaArchive");
 const { downloadResult } = require("./downloader");
+const { getUserPrefs, setUserPrefs } = require("./prefs");
+const mailer = require("./mailer");
 
 // Config
 const RESULTS_PER_PAGE = 5;
@@ -110,23 +112,217 @@ function sourceTag(result) {
   return "";
 }
 
+// ─── Onboarding ───
+
+const FORMATS = ["epub", "pdf", "mobi", "azw3"];
+
+function formatPrefsMessage(prefs) {
+  const lines = [
+    `Format : ${(prefs.format || "epub").toUpperCase()}`,
+    `Email : ${prefs.email || "non configure"}`,
+    `Kindle : ${prefs.kindleEmail || "non configure"}`,
+    `Livraison : ${prefs.delivery === "kindle" ? "Kindle" : prefs.delivery === "email" ? "Email" : "Telegram"}`,
+  ];
+  return lines.join("\n");
+}
+
+async function startOnboarding(ctx) {
+  const uid = ctx.from.id;
+  const state = getUserState(uid);
+  state.onboardingStep = "format";
+
+  await ctx.reply(
+    "👋 Bienvenue ! Configurons tes preferences.\n\n" +
+    "1/4 — Quel format de livre preferes-tu ?",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📗 EPUB", "ob_fmt_epub"), Markup.button.callback("📕 PDF", "ob_fmt_pdf")],
+      [Markup.button.callback("📙 MOBI", "ob_fmt_mobi"), Markup.button.callback("📘 AZW3", "ob_fmt_azw3")],
+    ])
+  );
+}
+
+// Onboarding: format choice
+for (const fmt of FORMATS) {
+  bot.action(`ob_fmt_${fmt}`, async (ctx) => {
+    await ctx.answerCbQuery();
+    const uid = ctx.from.id;
+    const state = getUserState(uid);
+    setUserPrefs(uid, { format: fmt });
+    state.onboardingStep = "email";
+
+    await ctx.editMessageText(
+      `Format : ${fmt.toUpperCase()} ✓\n\n` +
+      "2/4 — Veux-tu recevoir les livres par email ?\n" +
+      "Envoie ton adresse email ou clique sur Passer.",
+      Markup.inlineKeyboard([[Markup.button.callback("⏭ Passer", "ob_skip_email")]])
+    );
+  });
+}
+
+// Onboarding: skip email
+bot.action("ob_skip_email", async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = getUserState(uid);
+  state.onboardingStep = "kindle";
+
+  await ctx.editMessageText(
+    "Email : passe ✓\n\n" +
+    "3/4 — As-tu un Kindle ? Envoie ton adresse Kindle\n" +
+    "(ex: ton-nom@kindle.com) ou clique sur Passer.\n\n" +
+    "Astuce : les vieux Kindle ne supportent pas EPUB,\nutilise MOBI ou AZW3.",
+    Markup.inlineKeyboard([[Markup.button.callback("⏭ Passer", "ob_skip_kindle")]])
+  );
+});
+
+// Onboarding: skip kindle
+bot.action("ob_skip_kindle", async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  finishOnboarding(ctx, uid);
+});
+
+function finishOnboarding(ctx, uid) {
+  const state = getUserState(uid);
+  state.onboardingStep = null;
+  const prefs = setUserPrefs(uid, { onboarded: true });
+
+  ctx.editMessageText(
+    "✅ Configuration terminee !\n\n" +
+    formatPrefsMessage(prefs) + "\n\n" +
+    "Envoie-moi le titre d'un livre pour commencer.\n" +
+    "Tu peux modifier tes preferences avec /settings"
+  );
+}
+
 // /start
 bot.start((ctx) => {
+  const prefs = getUserPrefs(ctx.from.id);
+  if (!prefs.onboarded) {
+    return startOnboarding(ctx);
+  }
   ctx.reply(
-    "👋 Bonjour ! Envoie-moi le titre d'un livre et je le chercherai pour toi.\n\n" +
-    "Je cherche sur Anna's Archive et Prowlarr. " +
-    "Tu pourras ensuite choisir le résultat à télécharger."
+    "👋 Bon retour ! Envoie-moi le titre d'un livre.\n\n" +
+    "Commandes : /settings /help"
   );
 });
 
 // /help
 bot.help((ctx) => {
   ctx.reply(
-    "📖 Commandes disponibles :\n\n" +
+    "📖 Commandes :\n\n" +
     "/start - Message de bienvenue\n" +
-    "/help - Afficher cette aide\n\n" +
-    "Envoie simplement le titre d'un livre pour lancer une recherche."
+    "/settings - Modifier tes preferences\n" +
+    "/help - Cette aide\n\n" +
+    "Envoie un titre de livre pour lancer une recherche."
   );
+});
+
+// /settings
+bot.command("settings", (ctx) => {
+  const prefs = getUserPrefs(ctx.from.id);
+  const buttons = [
+    [Markup.button.callback(`Format : ${(prefs.format || "epub").toUpperCase()}`, "set_format")],
+    [Markup.button.callback(`Email : ${prefs.email || "non configure"}`, "set_email")],
+    [Markup.button.callback(`Kindle : ${prefs.kindleEmail || "non configure"}`, "set_kindle")],
+    [Markup.button.callback(
+      `Livraison : ${prefs.delivery === "kindle" ? "Kindle" : prefs.delivery === "email" ? "Email" : "Telegram"}`,
+      "set_delivery"
+    )],
+  ];
+  ctx.reply("⚙️ Tes preferences :", Markup.inlineKeyboard(buttons));
+});
+
+// Settings: change format
+bot.action("set_format", async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    "Choisis ton format prefere :",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📗 EPUB", "sf_epub"), Markup.button.callback("📕 PDF", "sf_pdf")],
+      [Markup.button.callback("📙 MOBI", "sf_mobi"), Markup.button.callback("📘 AZW3", "sf_azw3")],
+    ])
+  );
+});
+
+for (const fmt of FORMATS) {
+  bot.action(`sf_${fmt}`, async (ctx) => {
+    await ctx.answerCbQuery();
+    setUserPrefs(ctx.from.id, { format: fmt });
+    await ctx.editMessageText(`✅ Format mis a jour : ${fmt.toUpperCase()}`);
+  });
+}
+
+// Settings: change email
+bot.action("set_email", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = getUserState(ctx.from.id);
+  state.onboardingStep = "set_email";
+  await ctx.editMessageText(
+    "Envoie ton adresse email (ou /cancel pour annuler) :",
+    Markup.inlineKeyboard([[Markup.button.callback("🗑 Supprimer", "del_email")]])
+  );
+});
+
+bot.action("del_email", async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = getUserState(uid);
+  state.onboardingStep = null;
+  const prefs = getUserPrefs(uid);
+  const updates = { email: null };
+  if (prefs.delivery === "email") updates.delivery = "telegram";
+  setUserPrefs(uid, updates);
+  await ctx.editMessageText("✅ Email supprime.");
+});
+
+// Settings: change kindle
+bot.action("set_kindle", async (ctx) => {
+  await ctx.answerCbQuery();
+  const state = getUserState(ctx.from.id);
+  state.onboardingStep = "set_kindle";
+  await ctx.editMessageText(
+    "Envoie ton adresse Kindle (ex: ton-nom@kindle.com)\nou /cancel pour annuler :",
+    Markup.inlineKeyboard([[Markup.button.callback("🗑 Supprimer", "del_kindle")]])
+  );
+});
+
+bot.action("del_kindle", async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = getUserState(uid);
+  state.onboardingStep = null;
+  const prefs = getUserPrefs(uid);
+  const updates = { kindleEmail: null };
+  if (prefs.delivery === "kindle") updates.delivery = "telegram";
+  setUserPrefs(uid, updates);
+  await ctx.editMessageText("✅ Kindle supprime.");
+});
+
+// Settings: change delivery method
+bot.action("set_delivery", async (ctx) => {
+  await ctx.answerCbQuery();
+  const prefs = getUserPrefs(ctx.from.id);
+  const buttons = [[Markup.button.callback("📱 Telegram", "sd_telegram")]];
+  if (prefs.email) buttons.push([Markup.button.callback("📧 Email", "sd_email")]);
+  if (prefs.kindleEmail) buttons.push([Markup.button.callback("📚 Kindle", "sd_kindle")]);
+  await ctx.editMessageText("Choisis ta methode de livraison :", Markup.inlineKeyboard(buttons));
+});
+
+for (const method of ["telegram", "email", "kindle"]) {
+  bot.action(`sd_${method}`, async (ctx) => {
+    await ctx.answerCbQuery();
+    setUserPrefs(ctx.from.id, { delivery: method });
+    const label = method === "kindle" ? "Kindle" : method === "email" ? "Email" : "Telegram";
+    await ctx.editMessageText(`✅ Livraison par ${label}.`);
+  });
+}
+
+// Cancel settings input
+bot.command("cancel", (ctx) => {
+  const state = getUserState(ctx.from.id);
+  state.onboardingStep = null;
+  ctx.reply("Annule.");
 });
 
 function buildResultButtons(results, page) {
@@ -300,9 +496,64 @@ async function safeSearch(fn, name) {
 // /search command
 bot.command("search", handleSearch);
 
-// Plain text = search
+// Plain text handler — intercept email input during onboarding/settings
 bot.on("text", (ctx) => {
   if (ctx.message.text.startsWith("/")) return;
+
+  const uid = ctx.from.id;
+  const state = getUserState(uid);
+  const text = ctx.message.text.trim();
+
+  // Handle onboarding email input
+  if (state.onboardingStep === "email" || state.onboardingStep === "set_email") {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(text)) {
+      return ctx.reply("❌ Adresse email invalide. Reessaie ou clique sur Passer.");
+    }
+    setUserPrefs(uid, { email: text });
+    if (state.onboardingStep === "set_email") {
+      state.onboardingStep = null;
+      return ctx.reply(`✅ Email mis a jour : ${text}`);
+    }
+    // Continue onboarding to kindle step
+    state.onboardingStep = "kindle";
+    return ctx.reply(
+      `Email : ${text} ✓\n\n` +
+      "3/4 — As-tu un Kindle ? Envoie ton adresse Kindle\n" +
+      "(ex: ton-nom@kindle.com) ou clique sur Passer.\n\n" +
+      "Astuce : les vieux Kindle ne supportent pas EPUB,\nutilise MOBI ou AZW3.",
+      Markup.inlineKeyboard([[Markup.button.callback("⏭ Passer", "ob_skip_kindle")]])
+    );
+  }
+
+  // Handle onboarding/settings kindle input
+  if (state.onboardingStep === "kindle" || state.onboardingStep === "set_kindle") {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(text)) {
+      return ctx.reply("❌ Adresse email invalide. Reessaie ou clique sur Passer.");
+    }
+    setUserPrefs(uid, { kindleEmail: text });
+    if (state.onboardingStep === "set_kindle") {
+      state.onboardingStep = null;
+      return ctx.reply(`✅ Kindle mis a jour : ${text}`);
+    }
+    // Finish onboarding
+    state.onboardingStep = null;
+    const prefs = setUserPrefs(uid, { onboarded: true });
+    return ctx.reply(
+      "✅ Configuration terminee !\n\n" +
+      formatPrefsMessage(prefs) + "\n\n" +
+      "Envoie-moi le titre d'un livre pour commencer.\n" +
+      "Tu peux modifier tes preferences avec /settings"
+    );
+  }
+
+  // Check if user needs onboarding
+  const prefs = getUserPrefs(uid);
+  if (!prefs.onboarded) {
+    return startOnboarding(ctx);
+  }
+
   return handleSearch(ctx);
 });
 
@@ -397,6 +648,45 @@ bot.action("cancel_dl", async (ctx) => {
   }
 });
 
+// ─── Delivery ───
+
+async function deliverFile(ctx, filePath, filename, title, prefs) {
+  const method = prefs.delivery || "telegram";
+
+  if (method === "email" && prefs.email && mailer.isConfigured()) {
+    await ctx.editMessageText(`📧 Envoi par email a ${prefs.email}...`);
+    try {
+      await mailer.sendBookByEmail(filePath, filename, prefs.email);
+      await ctx.editMessageText(`✅ Envoye par email a ${prefs.email} ! 📖`);
+    } catch (e) {
+      console.error("Email send error:", e.message);
+      await ctx.editMessageText("❌ Erreur envoi email. Envoi par Telegram...");
+      await sendViaTelegram(ctx, filePath, filename, title);
+    }
+  } else if (method === "kindle" && prefs.kindleEmail && mailer.isConfigured()) {
+    await ctx.editMessageText(`📚 Envoi vers Kindle (${prefs.kindleEmail})...`);
+    try {
+      await mailer.sendToKindle(filePath, filename, prefs.kindleEmail);
+      await ctx.editMessageText(`✅ Envoye sur ton Kindle ! 📖\nVerifie dans quelques minutes.`);
+    } catch (e) {
+      console.error("Kindle send error:", e.message);
+      await ctx.editMessageText("❌ Erreur envoi Kindle. Envoi par Telegram...");
+      await sendViaTelegram(ctx, filePath, filename, title);
+    }
+  } else {
+    await sendViaTelegram(ctx, filePath, filename, title);
+  }
+}
+
+async function sendViaTelegram(ctx, filePath, filename, title) {
+  await ctx.editMessageText(`📤 Envoi de « ${title} »...`);
+  await ctx.replyWithDocument(
+    { source: filePath, filename },
+    { caption: `📖 ${title}` }
+  );
+  await ctx.editMessageText("✅ Envoye ! Bonne lecture 📖");
+}
+
 // Download handler
 bot.action(/dl_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -485,18 +775,13 @@ bot.action(/dl_(\d+)/, async (ctx) => {
         continue;
       }
 
-      // Send the file
+      // Deliver the file
       const safeTitle = title.replace(/[^\w\s\-]/g, "").trim().slice(0, 60) || "livre";
       const filename = `${safeTitle}.${ext}`;
-
-      await ctx.editMessageText(`📤 Envoi de « ${title} »...`);
+      const prefs = getUserPrefs(ctx.from.id);
 
       try {
-        await ctx.replyWithDocument(
-          { source: filePath, filename },
-          { caption: `📖 ${title}` }
-        );
-        await ctx.editMessageText("✅ Envoyé ! Bonne lecture 📖");
+        await deliverFile(ctx, filePath, filename, title, prefs);
       } finally {
         if (filePath && filePath.startsWith(os.tmpdir())) {
           try { fs.unlinkSync(filePath); } catch {}

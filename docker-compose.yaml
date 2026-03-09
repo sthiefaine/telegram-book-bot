@@ -24,6 +24,13 @@ services:
       - BOOKS_DOWNLOAD_PATH=${BOOKS_DOWNLOAD_PATH:-/downloads/books}
       - DOWNLOAD_TIMEOUT_MINUTES=${DOWNLOAD_TIMEOUT_MINUTES:-15}
       - LOCAL_API_SERVER=http://telegram-bot-api:8081
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM=${SMTP_FROM}
+    volumes:
+      - bot-data:/app/data
     depends_on:
       - prowlarr
       - telegram-bot-api
@@ -42,3 +49,4 @@ services:
 volumes:
   prowlarr-config:
   telegram-bot-api-data:
+  bot-data:
